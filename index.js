@@ -1,160 +1,175 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
-const { google } = require('googleapis');
-
-const config = {
-  channelSecret: process.env.CHANNEL_SECRET,
-  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-};
-
-const client = new line.messagingApi.MessagingApiClient({
-  channelAccessToken: process.env.CHANNEL_ACCESS_TOKEN,
-});
-
-const SHEET_ID = '10Bl39kXwP9liGhymCXwzfxJMd_hIGbiadMzsn8gO1J0';
-const SHEET_NAME = '工作表1';
-
-async function getSheets() {
-  const auth = new google.auth.GoogleAuth({
-    scopes: ['https://www.googleapis.com/auth/spreadsheets'],
-  });
-  const authClient = await auth.getClient();
-  return google.sheets({ version: 'v4', auth: authClient });
-}
-
-async function appendRow(values) {
-  const sheets = await getSheets();
-  await sheets.spreadsheets.values.append({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:G`,
-    valueInputOption: 'RAW',
-    resource: { values: [values] },
-  });
-}
-
-async function getRows() {
-  const sheets = await getSheets();
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SHEET_ID,
-    range: `${SHEET_NAME}!A:G`,
-  });
-  return res.data.values || [];
-}
+const axios = require('axios');
 
 const app = express();
 
+const config = {
+  channelSecret: '1a0ada3c843c2d84f86dabaf440c1351',
+  channelAccessToken: 'UQz8/pVIDyYbYxIgsQdYVLTOLaCzO+oPNm1OmSf7Gid5IpAauMIhPa6V8FlhXBNzbZf7kBRGMVBUyTbaY3KWMdMvNzb65jxy9HAED8bsBEWlU9BfLV1BWo72bRPcVj80ov0h2zc8hQziXYYkhAsf/QdB04t89/1O/w1cDnyilFU='
+};
+
+// Google Apps Script 網址
+const GAS_URL = 'https://script.google.com/macros/s/AKfycbzOCTfFAgDBrQLFCPkR65E6Kj7SMKoQcaeMuQbGEiADCFHZz0VgNDZ0kXJUguEJFOfD/exec';
+
+const client = new line.Client(config);
+
+// Webhook endpoint
 app.post('/webhook', line.middleware(config), (req, res) => {
   Promise.all(req.body.events.map(handleEvent))
-    .then((result) => res.json(result))
-    .catch((err) => { console.error(err); res.status(500).end(); });
+    .then(result => res.json(result))
+    .catch(err => {
+      console.error(err);
+      res.status(500).end();
+    });
 });
 
+// 健康檢查
+app.get('/', (req, res) => res.send('庫存管理 Bot 運作中 ✅'));
+
+// 主要事件處理
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return null;
-  const text = event.message.text.trim();
-  const now = new Date().toLocaleString('zh-TW', { timeZone: 'Asia/Taipei' });
-  let reply = '';
+
+  const userMsg = event.message.text.trim();
+  let replyText = '';
 
   try {
-    if (text.startsWith('入庫')) {
-      const parts = text.split(' ');
-      if (parts.length < 3) {
-        reply = '❌ 格式錯誤！\n入庫 品名 數量 效期\n例：入庫 玫瑰手霜 10 2026/12';
+    // 指令解析
+    if (userMsg === '查詢' || userMsg === '庫存' || userMsg === '查庫存') {
+      replyText = await queryAll();
+
+    } else if (userMsg.startsWith('查 ')) {
+      const itemName = userMsg.slice(2).trim();
+      replyText = await queryItem(itemName);
+
+    } else if (userMsg.startsWith('入庫 ')) {
+      // 格式：入庫 商品名稱 數量
+      const parts = userMsg.slice(3).trim().split(' ');
+      if (parts.length < 2 || isNaN(parts[parts.length - 1])) {
+        replyText = '❌ 格式錯誤\n正確格式：入庫 商品名稱 數量\n例如：入庫 蘋果 50';
       } else {
-        const [, name, qty, exp = '無'] = parts;
-        await appendRow([now, '入庫', name, qty, exp, '', '']);
-        reply = `✅ 入庫完成！\n品名：${name}\n數量：${qty}\n效期：${exp}`;
+        const qty = parseInt(parts[parts.length - 1]);
+        const name = parts.slice(0, -1).join(' ');
+        replyText = await updateStock(name, qty, '入庫');
       }
 
-    } else if (text.startsWith('出庫')) {
-      const parts = text.split(' ');
-      if (parts.length < 3) {
-        reply = '❌ 格式錯誤！\n出庫 品名 數量\n例：出庫 玫瑰手霜 3';
+    } else if (userMsg.startsWith('出庫 ')) {
+      // 格式：出庫 商品名稱 數量
+      const parts = userMsg.slice(3).trim().split(' ');
+      if (parts.length < 2 || isNaN(parts[parts.length - 1])) {
+        replyText = '❌ 格式錯誤\n正確格式：出庫 商品名稱 數量\n例如：出庫 蘋果 10';
       } else {
-        const [, name, qty] = parts;
-        await appendRow([now, '出庫', name, qty, '', '', '']);
-        reply = `✅ 出庫完成！\n品名：${name}\n數量：${qty}`;
+        const qty = parseInt(parts[parts.length - 1]);
+        const name = parts.slice(0, -1).join(' ');
+        replyText = await updateStock(name, qty, '出庫');
       }
 
-    } else if (text === '庫存總覽') {
-      const rows = await getRows();
-      const inventory = {};
-      rows.slice(1).forEach(row => {
-        const type = row[1], name = row[2], qty = parseInt(row[3]) || 0;
-        if (!inventory[name]) inventory[name] = 0;
-        if (type === '入庫') inventory[name] += qty;
-        if (type === '出庫') inventory[name] -= qty;
-      });
-      const lines = Object.entries(inventory).map(([name, qty]) => `${name}：${qty}`);
-      reply = lines.length ? `📦 庫存總覽\n${lines.join('\n')}` : '目前沒有庫存資料';
-
-    } else if (text.startsWith('庫存')) {
-      const name = text.replace('庫存', '').trim();
-      if (!name) {
-        reply = '請輸入品名，例：庫存 玫瑰手霜';
+    } else if (userMsg.startsWith('新增 ')) {
+      // 格式：新增 商品名稱 初始數量
+      const parts = userMsg.slice(3).trim().split(' ');
+      if (parts.length < 2 || isNaN(parts[parts.length - 1])) {
+        replyText = '❌ 格式錯誤\n正確格式：新增 商品名稱 初始數量\n例如：新增 香蕉 100';
       } else {
-        const rows = await getRows();
-        let total = 0;
-        rows.slice(1).forEach(row => {
-          if (row[2] === name) {
-            const qty = parseInt(row[3]) || 0;
-            if (row[1] === '入庫') total += qty;
-            if (row[1] === '出庫') total -= qty;
-          }
-        });
-        reply = `📦 ${name}\n目前庫存：${total}`;
+        const qty = parseInt(parts[parts.length - 1]);
+        const name = parts.slice(0, -1).join(' ');
+        replyText = await addItem(name, qty);
       }
 
-    } else if (text === '今日出庫') {
-      const rows = await getRows();
-      const today = new Date().toLocaleDateString('zh-TW', { timeZone: 'Asia/Taipei' });
-      const todayRows = rows.slice(1).filter(row => row[0] && row[0].includes(today) && row[1] === '出庫');
-      if (todayRows.length === 0) {
-        reply = '今日尚無出庫記錄';
-      } else {
-        const lines = todayRows.map(row => `${row[2]}：${row[3]}`);
-        reply = `📤 今日出庫\n${lines.join('\n')}`;
-      }
-
-    } else if (text === '低庫存') {
-      const rows = await getRows();
-      const inventory = {};
-      rows.slice(1).forEach(row => {
-        const type = row[1], name = row[2], qty = parseInt(row[3]) || 0;
-        if (!inventory[name]) inventory[name] = 0;
-        if (type === '入庫') inventory[name] += qty;
-        if (type === '出庫') inventory[name] -= qty;
-      });
-      const low = Object.entries(inventory).filter(([, qty]) => qty <= 5);
-      reply = low.length ? `⚠️ 低庫存商品\n${low.map(([n, q]) => `${n}：${q}`).join('\n')}` : '✅ 所有商品庫存充足';
-
-    } else if (text === '效期檢查') {
-      const rows = await getRows();
-      const expiryMap = {};
-      rows.slice(1).forEach(row => {
-        if (row[1] === '入庫' && row[4] && row[4] !== '無') {
-          expiryMap[row[2]] = row[4];
-        }
-      });
-      const lines = Object.entries(expiryMap).map(([name, exp]) => `${name}：${exp}`);
-      reply = lines.length ? `📅 效期一覽\n${lines.join('\n')}` : '尚無效期資料';
+    } else if (userMsg === '說明' || userMsg === 'help' || userMsg === '幫助') {
+      replyText = getHelp();
 
     } else {
-      reply = '📋 可用指令：\n\n入庫 品名 數量 效期\n出庫 品名 數量\n庫存 品名\n庫存總覽\n今日出庫\n低庫存\n效期檢查';
+      replyText = '❓ 看不懂這個指令\n\n傳送「說明」查看所有指令';
     }
 
   } catch (err) {
-    console.error(err);
-    reply = '❌ 發生錯誤，請稍後再試';
+    console.error('處理指令錯誤:', err);
+    replyText = '⚠️ 系統發生錯誤，請稍後再試';
   }
 
-  return client.replyMessage({
-    replyToken: event.replyToken,
-    messages: [{ type: 'text', text: reply }],
+  return client.replyMessage(event.replyToken, {
+    type: 'text',
+    text: replyText
   });
 }
 
-app.get('/', (req, res) => res.send('庫存管理 Bot 運作中！'));
+// ===== Google Apps Script 呼叫函式 =====
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on port ${port}`));
+// 查詢所有庫存
+async function queryAll() {
+  const res = await axios.get(GAS_URL, { params: { action: 'getAll' } });
+  const data = res.data;
+
+  if (!data || data.length === 0) return '📦 目前庫存是空的';
+
+  let msg = '📦 目前庫存：\n';
+  msg += '─────────────\n';
+  data.forEach(row => {
+    const stock = row.stock;
+    const emoji = stock <= 0 ? '🔴' : stock <= 10 ? '🟡' : '🟢';
+    msg += `${emoji} ${row.name}：${stock} ${row.unit || '個'}\n`;
+  });
+  msg += '─────────────\n';
+  msg += `共 ${data.length} 項商品`;
+  return msg;
+}
+
+// 查詢單一商品
+async function queryItem(name) {
+  const res = await axios.get(GAS_URL, { params: { action: 'getItem', name } });
+  const data = res.data;
+
+  if (!data || data.error) return `❌ 找不到「${name}」`;
+
+  const emoji = data.stock <= 0 ? '🔴' : data.stock <= 10 ? '🟡' : '🟢';
+  return `${emoji} 商品：${data.name}\n數量：${data.stock} ${data.unit || '個'}`;
+}
+
+// 入庫 / 出庫
+async function updateStock(name, qty, type) {
+  const action = type === '入庫' ? 'addStock' : 'removeStock';
+  const res = await axios.post(GAS_URL, { action, name, qty });
+  const data = res.data;
+
+  if (data.error) return `❌ ${data.error}`;
+
+  const emoji = type === '入庫' ? '📥' : '📤';
+  return `${emoji} ${type}成功！\n商品：${data.name}\n${type}數量：${qty}\n目前庫存：${data.stock} ${data.unit || '個'}`;
+}
+
+// 新增商品
+async function addItem(name, initialStock) {
+  const res = await axios.post(GAS_URL, { action: 'addItem', name, qty: initialStock });
+  const data = res.data;
+
+  if (data.error) return `❌ ${data.error}`;
+
+  return `✅ 新增成功！\n商品：${name}\n初始庫存：${initialStock} 個`;
+}
+
+// 說明文字
+function getHelp() {
+  return `📋 庫存管理指令說明
+─────────────
+🔍 查詢庫存
+  查詢（查看全部）
+  查 商品名稱
+
+📥 入庫
+  入庫 商品名稱 數量
+  例：入庫 蘋果 50
+
+📤 出庫
+  出庫 商品名稱 數量
+  例：出庫 蘋果 10
+
+➕ 新增商品
+  新增 商品名稱 初始數量
+  例：新增 香蕉 100
+─────────────
+🟢 充足  🟡 偏少(≤10)  🔴 缺貨`;
+}
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Bot 已啟動，Port: ${PORT}`));
